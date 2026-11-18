@@ -28,11 +28,20 @@ uvicorn main:app --host 127.0.0.1 --port 8000 --no-server-header
 docker compose up -d --build
 ```
 
-### Render / Railway / Fly.io
+### Render (One-Click Blueprint — Free Tier)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/dodophoenix1/universal-video-downloader)
 
 - **`Dockerfile`**: Non-root `appuser`, `ffmpeg` preinstalled, `/health` healthcheck
-- **`render.yaml`**: Ready for Render Git Deploy
-- **`Procfile`**: Ready for PaaS deployments
+- **`render.yaml`**: Configured for Render Docker Web Service (`plan: free`, 512 MB RAM, ephemeral filesystem, spins down after 15 min idle)
+- **`Procfile`**: Ready for PaaS deployments (Railway / Fly.io / Heroku)
+
+### GitHub Actions CI/CD
+
+Every push and pull request to `main` runs `.github/workflows/ci-cd.yml`:
+1. `pytest`, `ruff`, `bandit`, and `pip-audit` security checks
+2. Full Docker build + live `/health` container smoke test
+3. On `main`: publishes `ghcr.io/dodophoenix1/universal-video-downloader:latest` and optionally triggers a Render Deploy Hook if the `RENDER_DEPLOY_HOOK_URL` GitHub Actions secret is set (Settings → Secrets and variables → Actions).
 
 ## Environment Variables
 
@@ -40,7 +49,8 @@ docker compose up -d --build
 | --- | --- | --- |
 | `PORT` | `8000` | HTTP server port |
 | `MAX_DOWNLOAD_BYTES` | `2147483648` | Max download size (2 GiB) |
-| `MAX_ACTIVE_JOBS` | `24` | Concurrent / active job cap |
+| `MAX_ACTIVE_JOBS` | `24` | Concurrent / active job cap (`8` in `render.yaml`) |
+| `WORKER_POOL_SIZE` | `4` | Background download worker threads (`2` in `render.yaml`) |
 | `JOB_TTL_SECONDS` | `900` | TTL for uncollected temp jobs |
 | `RATE_LIMIT_INFO_PER_MIN` | `60` | `/api/info` requests/min/IP |
 | `RATE_LIMIT_JOBS_PER_MIN` | `30` | `/api/jobs` requests/min/IP |
