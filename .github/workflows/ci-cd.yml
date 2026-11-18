@@ -67,14 +67,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke-test container healthcheck and index
+      - name: Smoke-test container healthcheck and JS runtime (read-only)
         run: |
-          docker run -d --name streamvault-smoke -p 18000:8000 streamvault:ci
+          docker run -d --name streamvault-smoke \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -p 18000:8000 \
+            streamvault:ci
           trap 'docker rm -f streamvault-smoke || true' EXIT
           for _ in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:18000/health -o /tmp/health.json; then
               python3 -c 'import json; d = json.load(open("/tmp/health.json")); assert d.get("status") == "ok" and d.get("ffmpeg") is True, d'
               curl -fsS http://127.0.0.1:18000/ -o /dev/null
+              docker exec streamvault-smoke python -c 'import yt_dlp, yt_dlp_ejs; ydl = yt_dlp.YoutubeDL({"quiet": True}); rt = ydl._js_runtimes.get("deno"); assert rt and rt.info and rt.info.supported, rt; print("DENO_OK", rt.info.version, "EJS_OK", yt_dlp_ejs.version)'
               cat /tmp/health.json
               exit 0
             fi

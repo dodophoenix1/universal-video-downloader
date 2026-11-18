@@ -355,3 +355,197 @@ def test_thumbnail_ssrf_sanitized_in_info_response(monkeypatch):
     assert body["thumbnail"] is None
     assert "\r" not in body["title"]
     assert "\n" not in body["title"]
+
+
+def test_analyze_formats_direct_unprobed_mp4_and_selector():
+    info = {
+        "id": "mov",
+        "ext": "mp4",
+        "formats": [
+            {
+                "format_id": "0",
+                "ext": "mp4",
+                "url": "https://example.com/mov_bbb.mp4",
+                "vcodec": None,
+                "acodec": None,
+                "width": None,
+                "height": None,
+            }
+        ],
+    }
+    analyzed = main.analyze_formats(info)
+    assert analyzed["mp4"]["available"] is True
+    assert analyzed["mp4"]["qualities"] == [{"id": "best", "label": "Best Available"}]
+    assert analyzed["webm"]["available"] is False
+    assert analyzed["mp3"]["available"] is True
+    assert main._pick_format_selector(info, "mp4", "best") == "0/best[ext=mp4]/best"
+
+
+def test_analyze_formats_respects_explicit_audio_or_video_none():
+    video_only_no_dims = {
+        "formats": [
+            {
+                "format_id": "v0",
+                "ext": "mp4",
+                "vcodec": "avc1",
+                "acodec": "none",
+                "width": None,
+                "height": None,
+            }
+        ]
+    }
+    res1 = main.analyze_formats(video_only_no_dims)
+    assert res1["mp4"]["available"] is True
+    assert res1["mp3"]["available"] is False
+
+    audio_in_mp4_container = {
+        "formats": [
+            {
+                "format_id": "a0",
+                "ext": "mp4",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 128,
+            }
+        ]
+    }
+    res2 = main.analyze_formats(audio_in_mp4_container)
+    assert res2["mp4"]["available"] is False
+    assert res2["mp3"]["available"] is True
+
+
+def test_error_classification_and_non_leakage(monkeypatch):
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (main.socket.AF_INET, main.socket.SOCK_STREAM, 6, "", ("142.250.190.46", 443))
+        ],
+    )
+    fake_yt = MagicMock()
+    raised_error = RuntimeError("default")
+
+    class FailingYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=False):
+            raise raised_error
+
+    fake_yt.YoutubeDL = FailingYDL
+    monkeypatch.setattr(main, "yt_dlp", fake_yt)
+    client = TestClient(main.app)
+
+    cases = [
+        (
+            "ERROR: [youtube] x: Sign in to confirm you\u2019re not a bot (/tmp/secret 10.0.0.1)",
+            422,
+            "anti-bot",
+            "/tmp/secret",
+        ),
+        (
+            "ERROR: [instagram] Main webpage is locked behind the login page token=secret",
+            422,
+            "login",
+            "token=secret",
+        ),
+        (
+            "ERROR: This video is DRM protected",
+            422,
+            "DRM-protected",
+            None,
+        ),
+        (
+            "ERROR: Unsupported URL: https://example.com/?secret=123",
+            422,
+            "Unsupported URL",
+            "secret=123",
+        ),
+        (
+            "SSRF blocked: private IP 169.254.169.254",
+            400,
+            "SSRF security policy",
+            "169.254.169.254",
+        ),
+    ]
+    for msg, expected_code, expected_substr, forbidden in cases:
+        raised_error = RuntimeError(msg)
+        resp = client.post("/api/info", json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
+        assert resp.status_code == expected_code
+        detail = resp.json()["detail"]
+        assert expected_substr in detail
+        if forbidden:
+            assert forbidden not in detail
+
+
+def test_playlist_entry_unwrapping_enforces_ssrf(monkeypatch):
+    monkeypatch.setattr(
+        main.socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (main.socket.AF_INET, main.socket.SOCK_STREAM, 6, "", ("142.250.190.46", 443))
+        ],
+    )
+    fake_yt = MagicMock()
+    payload_to_return: dict = {}
+
+    class PlaylistYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=False):
+            return payload_to_return
+
+    fake_yt.YoutubeDL = PlaylistYDL
+    monkeypatch.setattr(main, "yt_dlp", fake_yt)
+    client = TestClient(main.app)
+
+    payload_to_return = {
+        "_type": "playlist",
+        "entries": [
+            {"id": "evil", "url": "http://169.254.169.254/latest/meta-data/", "formats": []}
+        ],
+    }
+    resp_evil = client.post("/api/info", json={"url": "https://www.instagram.com/p/test/"})
+    assert resp_evil.status_code == 400
+
+    payload_to_return = {
+        "_type": "playlist",
+        "entries": [
+            {
+                "id": "ok1",
+                "title": "Carousel Clip",
+                "ext": "mp4",
+                "extractor_key": "Instagram",
+                "formats": [{"format_id": "0", "ext": "mp4", "vcodec": None, "acodec": None}],
+            }
+        ],
+    }
+    resp_ok = client.post("/api/info", json={"url": "https://www.instagram.com/p/test/"})
+    assert resp_ok.status_code == 200
+    assert resp_ok.json()["formats"]["mp4"]["available"] is True
+
+
+def test_ytdlp_has_deno_and_ejs_available():
+    import yt_dlp as real_yt_dlp
+    import yt_dlp_ejs
+
+    assert yt_dlp_ejs.version
+    assert real_yt_dlp.__name__ == "yt_dlp"
+    with main._open_ydl(main._build_ydl_opts()) as ydl:
+        deno_rt = ydl._js_runtimes.get("deno")
+        assert deno_rt is not None
+        assert deno_rt.info is not None
+        assert deno_rt.info.supported is True

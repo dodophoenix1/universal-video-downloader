@@ -102,6 +102,10 @@ MEDIA_MIME_TYPES = {
     "webm": "video/webm",
     "mp3": "audio/mpeg",
 }
+VIDEO_CONTAINER_EXTS = frozenset({"mp4", "webm", "m4v", "mov", "mkv"})
+AUDIO_ONLY_EXTS = frozenset(
+    {"mp3", "m4a", "aac", "opus", "ogg", "oga", "wav", "flac", "weba"}
+)
 
 BLOCKED_HOSTNAMES = frozenset(
     {
@@ -709,16 +713,207 @@ def _quality_label(res: int) -> str:
 
 def _is_video_stream(fmt: dict[str, Any]) -> bool:
     vcodec = fmt.get("vcodec")
-    if vcodec is not None and str(vcodec).lower() == "none":
-        return False
-    if vcodec is None:
-        return bool(fmt.get("width") or fmt.get("height"))
-    return True
+    if vcodec is not None:
+        return str(vcodec).lower() != "none"
+    if fmt.get("width") or fmt.get("height"):
+        return True
+    ext = str(fmt.get("ext") or "").lower()
+    return ext in VIDEO_CONTAINER_EXTS
 
 
 def _is_audio_stream(fmt: dict[str, Any]) -> bool:
     acodec = fmt.get("acodec")
     return acodec is not None and str(acodec).lower() != "none"
+
+
+def _unwrap_single_entry(info: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap single-video playlist/carousel wrappers safely when entries exist."""
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                return entry
+        raise HTTPException(
+            status_code=422, detail="No downloadable media found at this URL."
+        )
+    return info
+
+
+def _classify_ytdlp_error(
+    exc: Exception, *, operation: str = "inspect"
+) -> tuple[str, int, str]:
+    """Map raw extractor/downloader errors into safe, non-leaking user messages."""
+    raw = str(exc).lower().replace("\u2019", "'")
+
+    if "ssrf blocked" in raw:
+        return (
+            "ssrf_blocked",
+            400,
+            "Target or redirect URL is prohibited by SSRF security policy.",
+        )
+    if (
+        "exceeds maximum" in raw
+        or "max-filesize" in raw
+        or "file is larger than" in raw
+    ):
+        return (
+            "file_too_large",
+            413,
+            "Requested media exceeds the maximum allowed file size.",
+        )
+    if (
+        "not a bot" in raw
+        or "ip is likely being blocked" in raw
+        or "ip address is blocked" in raw
+        or "all player responses are invalid" in raw
+    ):
+        return (
+            "bot_or_ip_blocked",
+            422,
+            "Blocked by source platform anti-bot protection (cloud/server IP is blocked; self-hosting on a home connection usually works).",
+        )
+    if (
+        "drm" in raw
+        or "widevine" in raw
+        or "fairplay" in raw
+    ):
+        return (
+            "drm_protected",
+            422,
+            "This media is DRM-protected and cannot be downloaded.",
+        )
+    if (
+        "geo restricted" in raw
+        or "geo-restricted" in raw
+        or "not available in your country" in raw
+        or "blocked it in your country" in raw
+        or "blocked in your country" in raw
+        or "not made this video available in your country" in raw
+    ):
+        return (
+            "geo_restricted",
+            422,
+            "This media is geo-restricted and unavailable from the server region.",
+        )
+    if (
+        "login required" in raw
+        or "requiring login" in raw
+        or "behind the login page" in raw
+        or "sign in to confirm" in raw
+        or "confirm your age" in raw
+        or "age-restricted" in raw
+        or "use --cookies" in raw
+        or "cookiesfrombrowser" in raw
+        or "authentication" in raw
+    ):
+        return (
+            "auth_required",
+            422,
+            "Source platform requires account login, cookies, or age verification.",
+        )
+    if (
+        "http error 429" in raw
+        or "too many requests" in raw
+        or "rate limit exceeded" in raw
+    ):
+        return (
+            "upstream_rate_limit",
+            429,
+            "Upstream platform rate-limited requests from this server IP (HTTP 429). Please try again later.",
+        )
+    if "http error 403" in raw or "403: forbidden" in raw:
+        return (
+            "upstream_forbidden",
+            422,
+            "Upstream platform rejected download access (HTTP 403; often caused by server IP blocks or expired stream signatures).",
+        )
+    if (
+        "private video" in raw
+        or "this video is private" in raw
+        or "members-only" in raw
+        or "join this channel" in raw
+        or "video unavailable" in raw
+        or "video is unavailable" in raw
+        or "has been removed" in raw
+        or "does not exist" in raw
+        or "has been terminated" in raw
+        or "http error 404" in raw
+    ):
+        return (
+            "unavailable",
+            422,
+            "This media is private, removed, or no longer available.",
+        )
+    if (
+        "javascript runtime" in raw
+        or "n challenge" in raw
+        or "signature extraction" in raw
+        or "js challenge" in raw
+        or "challenge solver" in raw
+        or "error running deno" in raw
+    ):
+        return (
+            "js_challenge_failed",
+            422,
+            "Failed to solve source platform JavaScript challenge.",
+        )
+    if (
+        "requested format is not available" in raw
+        or "no video formats found" in raw
+    ):
+        return (
+            "format_unavailable",
+            422,
+            "Requested format or quality is not available for this media.",
+        )
+    if (
+        "does not contain any audio" in raw
+        or "unable to obtain file audio codec" in raw
+    ):
+        return (
+            "no_audio_stream",
+            422,
+            "This video does not contain an audio track to extract as MP3.",
+        )
+    if "ffprobe" in raw or "ffmpeg" in raw or "postprocessing" in raw:
+        return (
+            "postprocess_error",
+            422,
+            "Media post-processing with FFmpeg failed.",
+        )
+    if "unsupported url" in raw or "no suitable extractor" in raw:
+        return (
+            "unsupported_url",
+            422,
+            "Unsupported URL or no downloadable video was found on this page.",
+        )
+    if (
+        "timed out" in raw
+        or "timeout" in raw
+        or "connection reset" in raw
+        or "unable to download webpage" in raw
+        or "unable to download api page" in raw
+        or "name resolution" in raw
+        or "tlsv1" in raw
+        or "ssl:" in raw
+    ):
+        return (
+            "upstream_network",
+            502,
+            "Network timeout or connection error while reaching the source platform.",
+        )
+
+    if operation == "inspect":
+        return (
+            "extract_failed",
+            422,
+            "Unable to inspect this video URL. Ensure it is public and supported.",
+        )
+    return (
+        "download_failed",
+        422,
+        "Failed to download media. Please verify the URL is public and supported.",
+    )
 
 
 def analyze_formats(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -729,17 +924,26 @@ def analyze_formats(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
         formats = [info]
 
     video_tiers: dict[str, set[int]] = {"mp4": set(), "webm": set()}
+    video_available: dict[str, bool] = {"mp4": False, "webm": False}
     has_audio = False
+    has_unprobed_audio = False
     max_abr = 0.0
 
     for fmt in formats:
         ext = str(fmt.get("ext") or "").lower()
+        acodec = fmt.get("acodec")
         if _is_audio_stream(fmt):
             has_audio = True
             abr = fmt.get("abr") or fmt.get("tbr") or 0
             if isinstance(abr, (int, float)) and abr > max_abr:
                 max_abr = float(abr)
+        elif acodec is None and (
+            ext in AUDIO_ONLY_EXTS or ext in VIDEO_CONTAINER_EXTS
+        ):
+            has_unprobed_audio = True
+
         if ext in video_tiers and _is_video_stream(fmt):
+            video_available[ext] = True
             res = effective_resolution(fmt.get("width"), fmt.get("height"))
             if res > 0:
                 video_tiers[ext].add(res)
@@ -747,7 +951,7 @@ def analyze_formats(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for container in ("mp4", "webm"):
         sorted_res = sorted(video_tiers[container], reverse=True)
-        if sorted_res:
+        if video_available[container]:
             qualities = [{"id": "best", "label": "Best Available"}]
             qualities.extend(
                 {"id": str(r), "label": _quality_label(r)} for r in sorted_res
@@ -756,7 +960,7 @@ def analyze_formats(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
         else:
             result[container] = {"available": False, "qualities": []}
 
-    if has_audio:
+    if has_audio or has_unprobed_audio:
         mp3_qualities = [{"id": "best", "label": "Best Audio"}]
         if max_abr >= 256:
             mp3_qualities.append({"id": "320", "label": "320 kbps"})
@@ -865,8 +1069,10 @@ def _pick_format_selector(info: dict[str, Any], fmt: str, quality: str) -> str:
             if audio_candidates:
                 aid = _safe_format_id(audio_candidates[0])
                 if aid:
-                    return f"{vid}+{aid}/best[ext={fmt_clean}]/best"
-            return f"{vid}+bestaudio/best[ext={fmt_clean}]/best"
+                    return f"{vid}+{aid}/{vid}/best[ext={fmt_clean}]/best"
+            if best_v.get("vcodec") is None and best_v.get("acodec") is None:
+                return f"{vid}/best[ext={fmt_clean}]/best"
+            return f"{vid}+bestaudio/{vid}/best[ext={fmt_clean}]/best"
 
     if quality_clean != "best" and quality_clean.isdigit():
         return (
@@ -941,6 +1147,7 @@ def _run_download_job(job_id: str, url: str, fmt: str, quality: str) -> None:
         if not isinstance(info, dict):
             raise TypeError("Unable to extract video metadata.")
 
+        info = _unwrap_single_entry(info)
         _validate_extracted_info_urls(info)
         selector = _pick_format_selector(info, fmt, quality)
         title = _sanitize_text(info.get("title"), max_len=120, default="streamvault_media")
@@ -1045,15 +1252,13 @@ def _run_download_job(job_id: str, url: str, fmt: str, quality: str) -> None:
                     }
                 )
     except Exception as exc:  # noqa: BLE001 - top-level background worker boundary must clean temp dir
-        logger.warning("Download job %s failed: %s", job_id, type(exc).__name__)
+        category, _status_code, safe_msg = _classify_ytdlp_error(
+            exc, operation="download"
+        )
+        logger.warning(
+            "Download job %s failed (%s: %s)", job_id, category, type(exc).__name__
+        )
         _cleanup_job_dir(job_dir)
-        safe_msg = "Failed to download media. Please verify the URL is public and supported."
-        if "exceeds maximum" in str(exc).lower() or "ssrf blocked" in str(exc).lower():
-            safe_msg = (
-                "Requested media was blocked by security policy."
-                if "ssrf blocked" in str(exc).lower()
-                else "Requested media exceeds the maximum allowed file size."
-            )
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id].update(
@@ -1257,6 +1462,7 @@ async def extract_info_endpoint(
             raise HTTPException(
                 status_code=422, detail="Could not extract metadata for this URL."
             )
+        info = _unwrap_single_entry(info)
         _validate_extracted_info_urls(info)
         return info
 
@@ -1266,16 +1472,13 @@ async def extract_info_endpoint(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning("Metadata extraction failed: %s", type(exc).__name__)
-        if "ssrf blocked" in str(exc).lower():
-            raise HTTPException(
-                status_code=400,
-                detail="Redirect target is prohibited by SSRF security policy.",
-            ) from exc
-        raise HTTPException(
-            status_code=422,
-            detail="Unable to inspect this video URL. Ensure it is public and supported.",
-        ) from exc
+        category, status_code, safe_msg = _classify_ytdlp_error(
+            exc, operation="inspect"
+        )
+        logger.warning(
+            "Metadata extraction failed (%s: %s)", category, type(exc).__name__
+        )
+        raise HTTPException(status_code=status_code, detail=safe_msg) from exc
 
     return {
         "id": _sanitize_text(info.get("id"), max_len=64, default=""),
