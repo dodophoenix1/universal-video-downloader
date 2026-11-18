@@ -6,13 +6,17 @@ services:
     healthCheckPath: /health
     envVars:
       - key: MAX_DOWNLOAD_BYTES
-        value: "2147483648"
+        value: "268435456"
       - key: MAX_ACTIVE_JOBS
-        value: "8"
+        value: "6"
       - key: WORKER_POOL_SIZE
         value: "2"
       - key: JOB_TTL_SECONDS
-        value: "900"
+        value: "300"
+      - key: RATE_LIMIT_INFO_PER_MIN
+        value: "30"
+      - key: RATE_LIMIT_JOBS_PER_MIN
+        value: "10"
       - key: TRUST_PROXY_HEADERS
         value: "true"
       - key: ENABLE_DOCS
