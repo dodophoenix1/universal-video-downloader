@@ -1,0 +1,21 @@
+services:
+  streamvault:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - MAX_DOWNLOAD_BYTES=2147483648
+      - MAX_ACTIVE_JOBS=24
+      - JOB_TTL_SECONDS=900
+      - RATE_LIMIT_INFO_PER_MIN=60
+      - RATE_LIMIT_JOBS_PER_MIN=30
+      - ENABLE_DOCS=false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=2G
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
